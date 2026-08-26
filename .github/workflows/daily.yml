@@ -1,0 +1,55 @@
+name: daily-pipeline
+
+# Step 6 - the daily refresh.
+# 05:15 UTC: after the ECB rates for the previous working day are published, and
+# early enough that a failure is visible at the start of the working day.
+on:
+  schedule:
+    - cron: "15 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ORDERS_SOURCE_URL: ${{ vars.ORDERS_SOURCE_URL }}
+      ORDERS_SOURCE_API_KEY: ${{ secrets.ORDERS_SOURCE_API_KEY }}
+      HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+      RUN_TRIGGER: github-actions
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run the pipeline
+        # `shell: bash` sets -o pipefail, so a failing pipeline is not masked by tee
+        shell: bash
+        run: python -m pipeline.run all | tee run-output.txt
+
+      - name: Publish the run summary
+        if: always()
+        run: |
+          {
+            echo '## Daily pipeline'
+            echo '```'
+            tail -n 60 run-output.txt 2>/dev/null || echo 'no output captured'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report the failure
+        if: failure()
+        run: |
+          python -m pipeline.run health || true
+          echo "::error::the daily refresh failed - customer_spend_eur and revenue_by_country_category are stale"
