@@ -1,258 +1,327 @@
-# Orders pipeline - Aqurate junior data engineer challenge
+# Orders pipeline
 
-An end-to-end ETL around the `orders_raw` endpoint from the brief: ingest into
-Postgres (Supabase), clean, pull daily ECB FX rates, convert to EUR, publish two
-reporting tables, refresh them daily and check them on every run.
+My solution to the Aqurate junior data engineer challenge. It pulls `orders_raw`
+from the REST endpoint into Postgres (Supabase), cleans it, fetches daily ECB
+exchange rates, converts everything to EUR, and builds the two reporting tables
+the brief asks for. It reruns itself every morning through GitHub Actions.
 
-**Python** does the moving of data (paged API extraction, FX, orchestration,
-monitoring); **SQL** does the modelling (cleaning rules, FX join, aggregation,
-assertions). Everything is idempotent - the whole pipeline can be re-run at any
-time and produces the same result.
+Python handles moving data around: paging the API, fetching rates, orchestration,
+monitoring. SQL does the actual modelling — the cleaning rules, the FX join, the
+aggregations, the assertions. I kept it that way on purpose; the transformation
+logic is the part a reviewer (or a future me) will want to read, and it reads
+better as SQL than as pandas.
+
+Everything is idempotent. You can run the whole thing twice in a row and get the
+same tables.
 
 ```
- orders_raw REST endpoint          frankfurter.dev (ECB)
-            |                                |
-            | keyset paging, row-count check | date range, weekends included
-            v                                v
-   public.orders_raw  (text + jsonb)   public.fx_rates
-            |                                |
-            |  ops.rebuild_orders_clean()    |
-            v                                |
-   public.orders_clean  ---------------------+
-            |            public.orders_clean_eur (view: amount_eur + rate used)
-            |                    |
-            |   ops.refresh_marts()
-            +---------> public.customer_spend_eur            (step 4)
-            +---------> public.revenue_by_country_category   (step 5)
-   public.orders_rejected (quarantine, with a reason per row)
-
-   every run: ops.pipeline_run + ops.quality_check_result  ->  ops.pipeline_health
+ orders_raw endpoint                frankfurter.dev (ECB rates)
+         |                                   |
+         v                                   v
+   public.orders_raw                   public.fx_rates
+   (everything as text + the raw jsonb)      |
+         |                                   |
+         |  ops.rebuild_orders_clean()       |
+         v                                   |
+   public.orders_clean  --------------------+
+   public.orders_rejected                    |
+                          public.orders_clean_eur  (view: EUR amount + which rate was used)
+                                   |
+                          ops.refresh_marts()
+                                   |
+              +--------------------+--------------------+
+              v                                         v
+   public.customer_spend_eur              public.revenue_by_country_category
 ```
 
-| Brief | Where |
-|---|---|
-| 1. Ingest | `src/pipeline/ingest_orders.py` -> `public.orders_raw` |
-| 2. Clean | `sql/02_orders_clean.sql` -> `public.orders_clean`, `public.orders_rejected` |
-| 3. FX rates | `src/pipeline/ingest_fx.py` -> `public.fx_rates` |
-| 4. Customer spend in EUR | `sql/03_marts.sql` -> `public.customer_spend_eur` |
-| 5. Country/category breakdown | `sql/03_marts.sql` -> `public.revenue_by_country_category` |
-| 6. Daily refresh | `.github/workflows/daily.yml` (+ `sql/05_pg_cron_optional.sql`) |
-| 7. Write-up | this file |
+Every run writes to `ops.pipeline_run` and `ops.quality_check_result`.
 
----
-
-## Quickstart
+## Running it
 
 ```bash
-git clone <this repo> && cd aqurate-orders-pipeline
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-cp .env.example .env      # fill in DATABASE_URL (Supabase -> Connect -> URI)
-
+cp .env.example .env          # DATABASE_URL from Supabase -> Connect -> URI
 export PYTHONPATH=src
-python -m pipeline.run setup      # create schema, functions, views
-python -m pipeline.run all        # ingest + FX + clean + marts + checks
-python -m pipeline.run report     # what the marts contain
-python -m pipeline.run profile    # the data-issue report this write-up is based on
-python -m pipeline.run health     # last run per step + open quality issues
-pytest -q                         # unit tests, no database needed
+
+python -m pipeline.run setup  # creates the schema, functions and views
+python -m pipeline.run all    # ingest + FX + clean + marts + checks
 ```
 
-`make setup|ingest|fx|transform|all|profile|report|health|test` do the same.
+Other commands: `report` (what's in the marts), `profile` (the data-issue report
+below), `health` (last run per step, open quality issues). `pytest -q` runs the
+unit tests, which don't need a database. There's a `Makefile` if you prefer
+`make all`. `SETUP.md` has the full Supabase and GitHub walkthrough.
 
----
+## What was wrong with the data
 
-## 1. Data issues in `orders_raw`, and what the pipeline does with them
+The first thing I did was load all 9,268 rows into a scratch schema and count
+things, before writing any cleaning code. `python -m pipeline.run profile`
+reproduces that report, so every number below can be checked.
 
-9,268 source rows. The grain is **one row per order line**, not per order: an
-order has one row per SKU (6,000 distinct orders after normalisation), which is
-what makes several of the issues below tricky.
+The detail that shapes everything else: **a row is an order line, not an order.**
+One order has one row per SKU. There are 9,268 rows but only 6,000 real orders.
+Miss that and the duplicate handling goes wrong in both directions.
 
-Every decision below is reproducible with `python -m pipeline.run profile`, and
-nothing is deleted silently: every row that does not reach `orders_clean` is
-written to `public.orders_rejected` with a reason, and a quality check asserts
-`orders_clean + orders_rejected = orders_raw`.
+Nothing gets dropped quietly. Every row that doesn't make it into `orders_clean`
+lands in `orders_rejected` with a reason attached, and one of the quality checks
+asserts that `clean + rejected = raw` on every run.
 
-| # | Issue | Rows | Decision | Why |
-|---|---|---|---|---|
-| 1 | Duplicated order lines | 263 | keep one copy per `(order_id, sku)` | 183 are byte-identical; the other 80 differ **only** in `order_id` formatting and `fx_reference_date`. Nothing else differs, so they are re-exports of the same line, not genuine second lines. |
-| 2 | `order_id` formatting: 49 with a leading space, 31 lower-case | 80 | trim + upper-case | All 80 turned out to be duplicates of a correctly formatted row - which is exactly why they must be normalised *before* de-duplicating, otherwise 80 phantom orders survive. |
-| 3 | Three different `order_ts` formats: ISO (5,592), day-first `dd/mm/yyyy` (2,270), Unix epoch seconds (1,406) | 9,268 | parse all three into `timestamp` | Day-first is unambiguous here: the first component goes up to 31 and the second never exceeds 12. Epoch values decode to the same Jan-Jun 2026 window as the other rows, which confirms the reading. |
-| 4 | `category` is NULL | 79 | back-fill from the SKU's own most frequent category | `sku`/`product_name` determine the category everywhere else in the data, so the value is recoverable; dropping the rows would lose real revenue. |
-| 5 | SKU spelled 3 different ways: `SKU-FA-O03` (letter O for zero), `SKUEL001`, `SKU HK 003` | 221 lines, 19 spellings for 16 products | canonical SKU = the most frequent spelling for that `product_name` | Data-driven instead of a hard-coded lookup: a new typo is absorbed automatically. Without it, `SKU-FA-003` revenue is split across two "products" and the de-duplication key is wrong. |
-| 6 | `customer_id` NULL | 103 | recover the id from `customer_email` (`customer<id>@example.com`) | `customer_id` <-> e-mail is 1:1 across the whole dataset, so the id is derivable. 100 rows are recovered; the other 3 are internal test accounts, dropped by rule 8. |
-| 7 | Negative `qty` (-1 to -3), all on `completed` orders | 167 | take the absolute value, flag `qty_sign_flipped` | Refunds have their own status, and these rows carry a normal positive price, so a negative quantity on a completed order reads as a sign error on export. Treating them as returns instead would only change spend by ~1%; the flag makes the assumption visible and reversible. |
-| 8 | Internal test orders: `status = 'test'`, all with `@aqurate.ai` e-mails | 101 | quarantine | The two signals agree exactly (101 rows both ways), so this is unambiguous - test traffic is not revenue. |
-| 9 | `unit_price = 999999` sentinel | 13 | quarantine as `implausible_unit_price` | Roughly 5,000x the median price of the same SKU (rule: > 20x the SKU median). Keeping them would add ~€13M of fictional revenue and put every country over the €40k threshold. Imputing a price would invent revenue that never existed, so they are quarantined for the data owner instead. |
-| 10 | `unit_price = 0` | 24 | keep, flag `zero_unit_price` | Plausible as a giveaway/replacement line: it contributes €0, so it cannot distort a total, and dropping it would understate order counts. |
-| 11 | `status = 'refunded'` | 403 | keep in `orders_clean`, exclude from spend/revenue | They are real orders and belong in the clean layer, but "total amount spent" should not include money that was given back. They are standalone orders with positive quantities, not reversal lines, so netting them off another order would be wrong. |
-| 12 | `fx_reference_date` on weekends, and 6,131 rows dated in the future | 9,268 | see the FX section below | |
+**Duplicates (263 rows).** 183 are byte-for-byte identical. The other 80 are the
+interesting ones: they differ *only* in how `order_id` is written and in
+`fx_reference_date`. Same customer, same SKU, same quantity, same price, same
+timestamp. That's a re-export of the same line, not a second purchase, so I keep
+one copy per `(order_id, sku)`. Which copy? I take the one whose `order_id` was
+already formatted correctly, and break remaining ties on the earlier
+`fx_reference_date`. That second part is a coin flip and I've flagged it as such
+— nothing in the data says which version is newer.
 
-Two observations that are **not** treated as errors, and why:
+**Messy `order_id` (80 rows).** 49 have a leading space, 31 are lower-case.
+Trimming and upper-casing is obvious enough, but the ordering matters: normalise
+*first*, then de-duplicate. All 80 turned out to be the duplicates described
+above, so if you de-duplicate on the raw string you end up with 6,080 orders
+instead of 6,000 and 80 phantom orders in your customer totals.
 
-* **RON prices are not RON-scaled.** A `RON` line for the same SKU has roughly
-  the same numeric price as an `EUR` line (~80 for the earbuds, not ~420). The
-  brief says to convert by `currency`, so the pipeline does exactly that, but in
-  a real project this is the first question to the data owner - either the
-  currency label or the price column is wrong. It is flagged here rather than
-  silently "fixed", because guessing would change revenue by a factor of five.
-* **Country/currency mixes** (RON orders from DE/HU/BG) are left alone: paying
-  in a different currency than your country of residence is normal.
+**Three timestamp formats (all 9,268 rows).** 5,592 ISO 8601, 2,270 in
+`dd/mm/yyyy`, 1,406 as Unix epoch seconds. Day-first rather than month-first
+isn't a guess: the first component goes up to 31 and the second never exceeds 12.
+The epoch values decode into the same Jan–Jun 2026 window as everything else,
+which was a nice confirmation that I'd read them correctly.
 
-## 2. FX: one rule, three real cases
+**SKUs spelled three different ways (221 rows).** `SKU-FA-O03` with a capital O
+instead of a zero, `SKUEL001` with no separators, `SKU HK 003` with spaces. 19
+spellings for 16 actual products. Instead of hard-coding a mapping I let the data
+decide: the canonical SKU for a product is whichever spelling appears most often
+for that `product_name`. A new typo gets absorbed automatically. This one isn't
+cosmetic either — without it `SKU-FA-003` revenue splits across two "products"
+and the de-duplication key is wrong.
 
-Rates come from Frankfurter (ECB reference rates, EUR base). The ECB publishes
-**working days only** - no weekends, no TARGET holidays - and `fx_reference_date`
-in this dataset runs 2026-08-23 .. 2026-09-03, so it covers weekends *and* dates
-that have not happened yet.
+**Missing `category` (79 rows).** Filled in from the SKU's own most common
+category. The SKU determines the category everywhere else in the dataset, so the
+value is genuinely recoverable and throwing the rows away would lose real
+revenue.
 
-The lookup is a single rule: **the most recent rate published on or before
-`fx_reference_date`** (a `LATERAL` join in `public.orders_clean_eur`). It covers
-all three cases at once, and every converted row also stores the rate and the
-date it came from, so any figure can be explained afterwards:
+**Missing `customer_id` (103 rows).** The e-mail encodes it
+(`customer1714@example.com`), and the id-to-e-mail mapping is 1:1 across the whole
+dataset, so 100 of them are recoverable. The remaining 3 belong to internal test
+accounts and get dropped anyway.
 
-| `fx_status` | Case | Behaviour |
-|---|---|---|
-| `exact` | reference date is a working day | that day's rate |
-| `carried_forward` | weekend / holiday | previous working day's rate |
-| `provisional` | reference date is in the future | latest published rate, flagged |
-| `missing` | no rate at all | row excluded from the marts **and the run fails** |
+**Negative quantities (167 rows).** All between -1 and -3, all on `completed`
+orders, all with a normal positive price. Refunds have their own status in this
+data, so I read these as a sign error somewhere in the export rather than as
+returns, and take the absolute value. I'm not certain about this one. Treating
+them as returns instead moves total spend by about 1%, which is why every
+affected row carries a `qty_sign_flipped` flag — if the data owner says otherwise,
+the rows are one query away.
 
-Conversion is `amount_eur = qty * unit_price / rate`, since the stored rate is
-"quote units per 1 EUR".
+**Internal test orders (101 rows).** `status = 'test'` and an `@aqurate.ai`
+e-mail address. Both signals pick out exactly the same 101 rows, so there's no
+ambiguity here. Test traffic isn't revenue; quarantined.
 
-This is also why the daily refresh in step 6 actually does something: as the
-future reference dates arrive, `provisional` rows are recomputed with the real
-published rate. It is not cosmetic - on the current data **DE sits at €39,842**
-against a €40,000 threshold, so a few days of rate movement can add a country to
-`revenue_by_country_category`.
+**Sentinel prices (13 rows).** `unit_price = 999999`, roughly five thousand times
+the median price of the same SKU. The rule I settled on is "more than 20x the
+median for that SKU", which catches these and nothing else (the widest genuine
+spread is under 2x). I quarantine them rather than imputing a price. Keeping
+them adds about €13M of imaginary revenue and pushes every country over the €40k
+threshold; imputing invents revenue that never existed. Neither is mine to
+decide, so they go in the reject table with the reason spelled out.
 
-## 3. Results (run of 2026-08-26)
+**Zero prices (24 rows).** Kept, with a flag. A €0 line is plausible as a
+giveaway or a replacement, it contributes nothing to a total so it can't distort
+anything, and dropping it would understate the order count.
 
-```
-orders_raw      9,268 lines
-orders_clean    8,895 lines / 5,932 orders   (373 quarantined: 259 duplicates,
-                                              101 internal test, 13 sentinel prices)
-customer_spend_eur   1,873 customers, €738,227.47 total
-revenue_by_country_category
-  #1  RO   €150,736.75   (books €23,252.54 / electronics €127,484.21)
-  #2  HU    €41,981.36   (books  €6,317.74 / electronics  €35,663.62)
-  below the €40k threshold: DE €39,842.18, BG €34,391.80
-```
+**Refunded orders (403 rows).** These stay in `orders_clean` — they're real
+orders — but they're excluded from spend and revenue. "Total amount spent"
+shouldn't include money that went back to the customer. Worth noting they're
+standalone orders with positive quantities, not reversal lines pointing at
+another order, so netting them off something else would be wrong.
 
-FX status of the converted lines: 506 `exact`, 137 `carried_forward` (weekend),
-1,202 `provisional` (future reference date, will self-correct).
+Two things I noticed and deliberately did *not* "fix":
 
-## 4. Monitoring - how I would find out if the daily job silently failed
+A RON line and an EUR line for the same SKU have roughly the same number in
+`unit_price` — about 80 for the earbuds, not about 420. If those RON prices were
+really in RON, that product costs €15. Either the currency label or the price
+column is wrong upstream. The brief says convert by `currency`, so that's what
+the pipeline does, but in a real project this is my first message to whoever owns
+the data, because guessing wrong changes revenue by a factor of five.
 
-The failure that matters is not a crash, it is a run that "succeeds" while
-publishing stale or wrong numbers. Four layers, cheapest first:
+Orders paid in RON from Germany, Hungary and Bulgaria look odd at first glance
+but are perfectly normal. People pay in currencies other than their country's.
+Left alone.
 
-1. **The job fails loudly instead of publishing.** `ops.run_daily()` runs the
-   clean + marts rebuild *and* the assertions in one transaction and raises if an
-   error-level check fails, so a bad run leaves the previous good tables in place
-   rather than replacing them with garbage. The ingest is verified against the
-   row count the API reports (`Content-Range`), so a half-downloaded snapshot
-   fails instead of quietly shrinking every total.
-2. **Assertions, not eyeballs** (`ops.quality_check_result`, 10 checks): clean
-   layer not empty; `clean + rejected = raw`; rejection rate <= 10%; every
-   non-EUR line found a rate; FX table no older than 5 days; marts refreshed
-   within 23h; mart total equals a straight recomputation from the clean layer;
-   no negative spend; the €40k threshold respected; and a warning counting rows
-   still converted with a provisional rate. Results are stored per run, so
-   "since when is this wrong?" is answerable.
-3. **Liveness, not just correctness.** A job that stops running produces no
-   errors at all. `ops.pipeline_health` flags any step whose last *successful*
-   run is older than 26 hours (`needs_attention`), which catches a disabled
-   schedule, an expired credential or a paused Supabase project. On top of that,
-   `HEARTBEAT_URL` (healthchecks.io / Better Stack / Cronitor, free tier) is
-   pinged **only** after a fully successful run - if the run never happens, the
-   dead man's switch alerts. That is the one check that survives the pipeline
-   being dead.
-4. **Somewhere a human looks.** GitHub Actions e-mails the repo owner when a
-   scheduled workflow fails, the run summary is written to the job page, and the
-   failure step prints `ops.pipeline_health`. In a production setup I would route
-   the same signal to the team's Slack/PagerDuty instead of one person's inbox,
-   and add freshness monitoring on the mart tables themselves (a
-   `max(refreshed_at)` check from the BI tool) so consumers detect staleness
-   independently of the pipeline that produces it.
+## Exchange rates
 
-Deliberately *not* alerted on: individual quarantined rows. They are expected
-(4.02% here); what is alertable is the *rate* changing, which is check 3.
+Rates come from Frankfurter, which republishes the ECB reference rates with EUR
+as the base. The ECB only publishes on working days — no weekends, no TARGET
+holidays — and `fx_reference_date` in this dataset runs from 2026-08-23 to
+2026-09-03. So it covers weekends *and* dates that haven't happened yet.
 
-## 5. Automation (step 6)
+Rather than special-casing each situation I use one rule: take the most recent
+rate published on or before `fx_reference_date`. It's a `LATERAL` join in
+`public.orders_clean_eur` and it handles all three cases by itself. Every
+converted row also stores the rate and the date that rate came from, so any
+number in the marts can be traced back afterwards:
 
-`.github/workflows/daily.yml` runs the full pipeline at 05:15 UTC - after the
-ECB rates for the previous working day are published, and early enough that a
-failure is visible at the start of the day. It needs two repository secrets:
-`DATABASE_URL` and `ORDERS_SOURCE_API_KEY` (optionally `HEARTBEAT_URL`).
+- `exact` — the reference date was a working day
+- `carried_forward` — weekend or holiday, so the previous working day's rate
+- `provisional` — the reference date is in the future, so the latest rate we have
+- `missing` — no rate at all, which excludes the row from the marts *and* fails
+  the run
 
-`sql/05_pg_cron_optional.sql` is the alternative with no external infrastructure
-at all: `pg_cron` + the `http` extension fetch the rates and refresh the marts
-from inside Supabase. Both are free.
+The conversion is `qty * unit_price / rate`, since the stored rate is quote units
+per one EUR.
 
-**Teardown after the 3-5 day observation window** (nothing here costs money, but
-so it does not run forever):
+This is also what makes the daily refresh in step 6 do something real rather than
+recompute the same numbers. As those future reference dates arrive, the
+`provisional` rows get recalculated with the rate that actually got published.
+And it's not academic: Germany currently sits at €39,842 against a €40,000
+threshold, so a few days of rate movement could add a whole country to the
+breakdown table.
 
-```bash
-# GitHub Actions: disable the workflow (Actions tab -> daily-pipeline -> Disable)
-# or delete .github/workflows/daily.yml
-```
-```sql
--- if the in-database schedule was used
-select cron.unschedule('aqurate-daily-refresh');
-```
+## Results
 
-## 6. AI usage
-
-Tool: **Claude (Claude Code)**, used as a pair programmer for the whole project.
-
-* **Profiling first, code second.** Rather than guessing at the data issues, the
-  9,268 rows were loaded into a scratch schema and profiled with SQL - every
-  number in section 1 comes from that pass, and the probes were kept as
-  `src/pipeline/profile_raw.py` so the claims stay reproducible.
-* **Kept:** the layered structure (landing zone as text -> clean -> marts), the
-  quarantine table, the `LATERAL` FX lookup with the rate stored next to the
-  amount, and the quality-check harness. The whole SQL layer was executed against
-  the real data in a scratch schema before being committed - which is how the
-  `percentile_cont` type mismatch and a `create or replace view` incompatibility
-  were caught rather than shipped.
-* **Changed / rejected:** the first ingest used `limit/offset` paging, which
-  silently loses and repeats rows when `order_id` is not unique - replaced with
-  keyset paging plus a row-count assertion, and a unit test that reproduces the
-  failure. It was not theoretical: the offset-paged snapshot reported 185
-  byte-identical duplicates against the keyset snapshot's 183, i.e. it invented
-  two rows at a page boundary. Suggestions to impute the `999999` prices and to drop the
-  negative-quantity rows were rejected in favour of quarantining and flagging:
-  inventing revenue and discarding it are both worse than making the assumption
-  visible. The dedupe tie-break (prefer the well-formatted `order_id`, then the
-  earlier `fx_reference_date`) is a judgement call, documented as such.
-* **Not delegated:** which rows count as revenue (refunded/test/zero-price), how
-  much of a price outlier is "too much", and the RON-scaling question above -
-  those are data-owner decisions, and the pipeline is written so each one is a
-  single visible line rather than a hidden default.
-
-## 7. Repository layout
+From the run on 2026-08-26:
 
 ```
-sql/01_schema.sql              tables, indexes, ops.settings, RLS
-sql/02_orders_clean.sql        cast helpers + ops.orders_judged + rebuild function
-sql/03_marts.sql               orders_clean_eur view + ops.refresh_marts()
-sql/04_quality_checks.sql      assertions, ops.run_daily(), health views
-sql/05_pg_cron_optional.sql    in-database daily schedule (optional)
-src/pipeline/ingest_orders.py  keyset-paged extraction + row-count verification
-src/pipeline/ingest_fx.py      Frankfurter -> fx_rates
-src/pipeline/transform.py      runs the SQL, surfaces failed checks
-src/pipeline/profile_raw.py    the data-issue report
-src/pipeline/run.py            CLI
-tests/                         pagination + FX parsing (no database required)
-.github/workflows/daily.yml    the daily schedule
+orders_raw            9,268 lines
+orders_clean          8,895 lines / 5,932 orders
+orders_rejected         373 lines  (259 duplicates, 101 internal test, 13 sentinel prices)
+customer_spend_eur    1,873 customers, €738,227.47 total
+
+revenue_by_country_category (Books + Electronics, above €40,000)
+  1. RO   €150,736.75   (books €23,252.54, electronics €127,484.21)
+  2. HU    €41,981.36   (books  €6,317.74, electronics  €35,663.62)
+
+  just below the line: DE €39,842.18, BG €34,391.80
 ```
 
-### Notes on the database
+Of the converted lines, 506 used an exact-date rate, 137 carried a rate forward
+over a weekend, and 1,202 are still provisional and will settle over the next
+week.
 
-All tables live in `public` (the names the brief asks for) with RLS enabled and
-no policies, so nothing is exposed through Supabase's REST API; the pipeline
-connects with the Postgres/service role, which bypasses RLS. Operational objects
-(run log, checks, settings, functions) live in `ops`.
+## How I'd know if this broke
+
+The failure I actually worry about isn't a crash. It's a run that reports success
+while quietly publishing stale or wrong numbers, because nobody looks at a green
+job.
+
+So the first line of defence is that the job refuses to publish garbage.
+`ops.run_daily()` rebuilds the clean layer, refreshes both marts and runs the
+assertions inside a single transaction, and raises if any error-level check
+fails. A bad run leaves yesterday's good tables in place instead of replacing
+them. Same idea on the way in: the ingest compares what it loaded against the row
+count PostgREST reports in `Content-Range`, so a half-downloaded snapshot fails
+loudly instead of silently shrinking every total.
+
+Then there are the assertions themselves, ten of them, stored per run in
+`ops.quality_check_result` so "since when has this been wrong?" is a question you
+can answer. The clean table isn't empty. `clean + rejected = raw`. The rejection
+rate is under 10%. Every non-EUR line found a rate. The FX table isn't more than
+five days stale. The marts were refreshed in the last 23 hours. The mart total
+matches a straight recomputation from the clean layer. No negative spend. Nothing
+in the country table sits below its own threshold. Plus a warning that counts how
+many lines are still converted at a provisional rate.
+
+None of that helps if the job stops running altogether, which produces no errors
+at all. Two things cover that. `ops.pipeline_health` flags any step whose last
+successful run is more than 26 hours old, which catches a disabled schedule, an
+expired password or a paused Supabase project. And `HEARTBEAT_URL` — a
+healthchecks.io ping, free — is only hit after a fully successful run, so if the
+run never happens, something external notices and e-mails me. That's the one
+check that survives the pipeline being completely dead.
+
+Finally, someone has to actually see it. GitHub e-mails the repo owner when a
+scheduled workflow fails, the run summary is written to the job page, and the
+failure step dumps `ops.pipeline_health` into the log. In a real team I'd send
+that to Slack or PagerDuty instead of one person's inbox, and I'd also put a
+freshness check on the mart tables from whatever BI tool reads them — so the
+consumers notice staleness on their own, independently of the pipeline that's
+supposed to be producing it.
+
+One thing I chose *not* to alert on: individual rejected rows. About 4% of rows
+get quarantined and that's expected and stable. What's worth waking someone up
+for is that percentage moving, which is what the rejection-rate check watches.
+
+## Automation
+
+`.github/workflows/daily.yml` runs the whole pipeline at 05:15 UTC. That time is
+deliberate — it's after the ECB rates for the previous working day are out, and
+early enough that a failure is visible at the start of the day. It needs two
+repository secrets, `DATABASE_URL` and `ORDERS_SOURCE_API_KEY`, plus
+`HEARTBEAT_URL` if you want the dead man's switch.
+
+`sql/05_pg_cron_optional.sql` is the same thing with no external infrastructure
+at all: `pg_cron` plus the `http` extension fetch the rates and refresh the marts
+from inside Supabase. Both options are free.
+
+To tear it down after a few days, disable the workflow in the Actions tab (or
+delete the file), and if the in-database schedule was used,
+`select cron.unschedule('aqurate-daily-refresh');`.
+
+## AI usage
+
+I used Claude (Claude Code) throughout, as a pair programmer rather than a code
+generator.
+
+What worked well was insisting on profiling before writing anything. It's very
+easy to get plausible-looking cleaning code for data nobody has looked at, so the
+first pass was loading the rows into a scratch schema and counting problems.
+Every number in the data-issues section comes from that, and I kept the queries
+as `src/pipeline/profile_raw.py` so the claims stay checkable instead of being
+prose I'd have to trust.
+
+I kept the overall shape: text-only landing zone, then clean, then marts; the
+quarantine table instead of deleting rows; the `LATERAL` FX lookup that stores
+the rate next to the amount; the quality-check harness. I also ran the entire SQL
+layer against the real data in a scratch schema before committing any of it,
+which is how a `percentile_cont` type mismatch and a `create or replace view`
+incompatibility got caught in development rather than in the first real run.
+
+The thing I changed and am happiest about: the first version of the ingest used
+`limit`/`offset` paging. That silently loses and repeats rows when the ordering
+column isn't unique, which `order_id` very much isn't here. It wasn't
+theoretical — the offset-paged snapshot reported 185 byte-identical duplicates
+where the correct one has 183, so it had invented two rows at a page boundary. I
+replaced it with keyset paging over `order_id`, a row-count assertion against the
+API, and a unit test that reproduces the failure with a deliberately small page
+size. That's my favourite part of this repo, mostly because the bug found itself
+through a check rather than through luck.
+
+Two suggestions I rejected: imputing a sensible price over the `999999` sentinel,
+and dropping the negative-quantity rows. Inventing revenue and throwing revenue
+away are both worse than making the assumption visible, so those rows are
+quarantined and flagged instead.
+
+And a few things I didn't delegate at all, because they aren't code decisions:
+which statuses count as revenue, how far from the median a price has to be before
+it stops being a price, and the RON-scaling question above. Those belong to
+whoever owns the data. The pipeline is written so each one is a single readable
+line rather than a default buried three functions deep.
+
+## Layout
+
+```
+sql/01_schema.sql             tables, indexes, ops.settings, RLS
+sql/02_orders_clean.sql       cast helpers, the ops.orders_judged view, the rebuild function
+sql/03_marts.sql              orders_clean_eur + ops.refresh_marts()
+sql/04_quality_checks.sql     assertions, ops.run_daily(), the health views
+sql/05_pg_cron_optional.sql   in-database schedule (optional)
+
+src/pipeline/ingest_orders.py keyset paging + row-count verification
+src/pipeline/ingest_fx.py     Frankfurter -> fx_rates
+src/pipeline/transform.py     runs the SQL, surfaces failed checks
+src/pipeline/profile_raw.py   the data-issue report
+src/pipeline/run.py           CLI
+
+tests/                        pagination and FX parsing, no database needed
+.github/workflows/daily.yml   the daily schedule
+```
+
+Tunables that shouldn't need a code change live in `ops.settings` — the €40,000
+threshold, which categories go in the breakdown, which statuses count as revenue,
+the price-outlier factor.
+
+All the tables the brief asks for are in `public` with RLS enabled and no
+policies, so nothing is readable through Supabase's REST API; the pipeline
+connects as the Postgres role, which bypasses RLS. Everything operational — the
+run log, the checks, the settings, the functions — lives in `ops`.
