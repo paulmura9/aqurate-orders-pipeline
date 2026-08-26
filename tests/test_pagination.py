@@ -22,7 +22,7 @@ class FakePostgrest:
         self.rows = sorted(rows, key=lambda r: r["order_id"])
         self.calls = 0
 
-    def get(self, url, params=None, headers=None, timeout=None):  # noqa: ANN001, ARG002
+    def get(self, url, params=None, headers=None, timeout=None): 
         self.calls += 1
         rows = self.rows
         cursor = (params or {}).get("order_id")
@@ -35,7 +35,7 @@ class FakePostgrest:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):  # noqa: ANN002
+    def __exit__(self, *exc): 
         return False
 
 
@@ -65,9 +65,9 @@ def _dataset() -> list[dict]:
     rows: list[dict] = []
     for i in range(1, 41):
         order_id = f"ORD{10000 + i}"
-        for line in range(1 + i % 3):  # 1-3 lines per order
+        for line in range(1 + i % 3): 
             rows.append({"order_id": order_id, "sku": f"SKU-{line}"})
-    rows.append(dict(rows[0]))  # an exact duplicate line, as in the real data
+    rows.append(dict(rows[0]))  
     return rows
 
 

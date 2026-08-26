@@ -16,7 +16,6 @@ class FakeFrankfurter:
         "base": "EUR",
         "start_date": "2026-08-21",
         "end_date": "2026-08-26",
-        # note the gap: 22 and 23 August are a weekend, the ECB publishes nothing
         "rates": {
             "2026-08-21": {"RON": 5.2563},
             "2026-08-24": {"RON": 5.2504},
@@ -25,7 +24,7 @@ class FakeFrankfurter:
         },
     }
 
-    def get(self, url, params=None, headers=None, timeout=None):  # noqa: ANN001, ARG002
+    def get(self, url, params=None, headers=None, timeout=None): 
         return _FakeResponse(self.payload)
 
 
@@ -54,8 +53,6 @@ def test_weekend_gaps_are_preserved_not_invented() -> None:
     rates = fetch_rates(FakeFrankfurter(), _settings(), date(2026, 8, 21), date(2026, 8, 26), ["RON"])
 
     assert set(rates) == {"2026-08-21", "2026-08-24", "2026-08-25", "2026-08-26"}
-    # the loader must not fabricate a Saturday rate - carrying the last working
-    # day forward is the SQL layer's job, and it is recorded in fx_rate_date
     assert "2026-08-22" not in rates
 
 

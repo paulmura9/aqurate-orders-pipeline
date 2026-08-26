@@ -10,17 +10,16 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:  # optional convenience for local runs
+try:  
     from dotenv import load_dotenv
 
     load_dotenv()
-except ModuleNotFoundError:  # pragma: no cover
+except ModuleNotFoundError:  
     pass
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SQL_DIR = PROJECT_ROOT / "sql"
 
-# Applied in order by `python -m pipeline.run setup`.
 SQL_FILES = (
     "01_schema.sql",
     "02_orders_clean.sql",
@@ -47,22 +46,16 @@ class Settings:
     orders_api_key: str
     fx_api_base: str = "https://api.frankfurter.dev/v1"
     fx_base_currency: str = "EUR"
-    # Rates are fetched from (earliest fx_reference_date - buffer) so a reference
-    # date that falls on a weekend still finds the previous working day's rate.
     fx_lookback_buffer_days: int = 10
     page_size: int = 1000
     http_timeout_seconds: int = 30
     http_max_retries: int = 5
-    # Optional dead man's switch (healthchecks.io, Better Stack, ...): pinged
-    # only when a full run finished successfully.
     heartbeat_url: str | None = None
     run_trigger: str = "manual"
     sql_files: tuple[str, ...] = field(default=SQL_FILES)
 
     @classmethod
     def from_env(cls) -> "Settings":
-        # `or` rather than a dict default: an environment variable that exists
-        # but is empty (an unset GitHub Actions variable) must fall back too.
         return cls(
             database_url=_require("DATABASE_URL"),
             orders_url=(

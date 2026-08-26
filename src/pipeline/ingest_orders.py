@@ -74,8 +74,6 @@ def iter_pages(session: requests.Session, settings: Settings) -> Iterator[list[d
             yield rows
             return
 
-        # The last order_id of a full page may continue on the next page: hand
-        # back only the complete groups and resume from the last complete one.
         last_id = rows[-1]["order_id"]
         complete = [row for row in rows if row["order_id"] != last_id]
         if complete:
